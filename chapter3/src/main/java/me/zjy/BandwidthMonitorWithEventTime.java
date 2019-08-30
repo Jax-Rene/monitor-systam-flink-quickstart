@@ -9,17 +9,12 @@ import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.time.Time;
 
-/**
- * @author zhuangjy
- * @create 2019-07-18 21:58
- */
-public class BandwidthMonitor {
-
+public class BandwidthMonitorWithEventTime {
 
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        // 设置处理时间,如果不设置的话默认为处理时间
-        env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);
+        // 设置事件时间
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
 
         DataStream<String> text = env.socketTextStream("localhost", 8080);
         text.map(new MapFunction<String, Tuple2<String, Long>>() {
