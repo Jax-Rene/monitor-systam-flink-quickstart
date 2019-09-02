@@ -15,7 +15,7 @@
 
 可以这么说，**一个批处理中，对应的窗口就是全部的数据。**在这里窗口的意义显得有点多余。
 
-但是在流处理中却是必须的，因为**流数据是无穷无尽，类似一条不断的河流一样。**窗口的概念在监控系统中也十分的重要。例如，我们有某个域名每分钟的流量，我们想监控某个域名的平均带宽是否低于某个指定阈值。
+但是在流处理中却是必须的，因为**流数据是无穷无尽，类似一条不断的河流一样。**这里就必须使用窗口来界定需要计算的数据范围。窗口的概念在监控系统中也十分的重要。例如，我们有某个域名每分钟的流量，我们想监控某个域名的平均带宽是否低于某个指定阈值。
 
 > 带宽的含义：一些主机服务商会给带宽以不同的含义。在这里，带宽几乎变成一个单位时间内的流量概念。意思是单位时间内的下行数据总量。意味着如果一个公司提供每月2GB的带宽，意思就是用户每月最多只能下载2GB的内容。 —— 《维基百科》
 >
@@ -231,5 +231,103 @@ DataStream<T> lateStream = result.getSideOutput(lateOutputTag);
 
 ### 更完善的带宽监控
 
-讲解完了Watermark，我们继续我们的编码工作。
+讲解完了Watermark，我们继续我们的带宽监控编码工作。这里，我们重新REVIEW下需求：
+
+> 每分钟计算当前这一分钟的实际带宽值，若低于100Mbps则产生报警
+
+关键字为每分钟，计算一分钟的数据。为了使结果是准确的且可复现的，我们使用事件时间，同时使用允许一分钟的数据延迟。超过一分钟延迟到达的数据全部丢弃。
+
+``` java
+package me.zjy;
+
+import org.apache.flink.api.common.functions.FilterFunction;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.java.tuple.Tuple3;
+import org.apache.flink.streaming.api.TimeCharacteristic;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
+import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.api.windowing.time.Time;
+
+import javax.annotation.Nullable;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+
+public class BandwidthMonitorWithEventTime {
+
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // 设置事件时间
+        env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+
+        DataStream<String> text = env.socketTextStream("localhost", 8080);
+        text.map(new MapFunction<String, Tuple3<Integer,String, Long>>() {
+            @Override
+            public Tuple3<Integer,String, Long> map(String s) throws Exception {
+                String[] items = s.split(" ");
+                // 返回 时间 -> channel -> 流量
+                Integer time = (int) LocalDateTime.parse(items[0]).toEpochSecond(ZoneOffset.ofHours(8));
+                String channel = items[1];
+                Long flow = Long.parseLong(items[2]);
+                return new Tuple3<>(time, channel, flow);
+            }
+        }).assignTimestampsAndWatermarks(new WatermarkGenerator())
+                .keyBy(1)
+                .timeWindow(Time.minutes(1))
+                .reduce((ReduceFunction<Tuple3<Integer, String, Long>>) (integerStringLongTuple3, t1) -> new Tuple3<>(integerStringLongTuple3.f0,integerStringLongTuple3.f1,integerStringLongTuple3.f2 + t1.f2))
+                // 过滤出带宽值低于100Mbps域名
+                .filter((FilterFunction<Tuple3<Integer, String, Long>>) integerStringLongTuple3 -> integerStringLongTuple3.f2 * 8.0 / 60 / 1024 / 1024 < 100)
+                .print();
+
+        env.execute("BandwidthMonitor");
+    }
+
+    private static class WatermarkGenerator implements AssignerWithPeriodicWatermarks<Tuple3<Integer,String,Long>> {
+
+        private long maxTimestamp = -1L;
+
+        @Nullable
+        @Override
+        public Watermark getCurrentWatermark() {
+            // Watermark设置为当前最大数据时间-1分钟
+            return new Watermark(maxTimestamp - 60 * 1000L);
+        }
+
+        @Override
+        public long extractTimestamp(Tuple3<Integer, String, Long> element, long previousElementTimestamp) {
+            long time = element.f0 * 1000L;
+            // 更新当前最大时间戳
+            maxTimestamp = Math.max(time,maxTimestamp);
+            return time;
+        }
+    }
+
+}
+
+```
+
+输入数据
+
+```
+2019-08-28T10:00:00 www.163.com 10000
+2019-08-28T10:01:00 www.163.com 100
+2019-08-28T10:02:00 www.163.com 100
+2019-08-28T09:01:00 www.163.com 100
+2019-08-28T10:06:00 www.163.com 100
+```
+
+输出结果
+
+```
+
+```
+
+
+
+在这个代码片段中有几个比较重要的点：
+
+1. env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime) 指定使用事件事件
+2. assignTimestampsAndWatermarks 指定事件获取方式以及Watermark生成策略
 
