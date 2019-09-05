@@ -13,7 +13,7 @@
 2. 计算
 3. 输出结果
 
-可以这么说，**一个批处理中，对应的窗口就是全部的数据。**在这里窗口的意义显得有点多余。
+可以这么说， **一个批处理中，对应的窗口就是全部的数据。 **在这里窗口的意义显得有点多余。
 
 但是在流处理中却是必须的，因为**流数据是无穷无尽，类似一条不断的河流一样。**这里就必须使用窗口来界定需要计算的数据范围。窗口的概念在监控系统中也十分的重要。例如，我们有某个域名每分钟的流量，我们想监控某个域名的平均带宽是否低于某个指定阈值。
 
@@ -238,32 +238,21 @@ DataStream<T> lateStream = result.getSideOutput(lateOutputTag);
 关键字为每分钟，计算一分钟的数据。为了使结果是准确的且可复现的，我们使用事件时间，同时使用允许一分钟的数据延迟。超过一分钟延迟到达的数据全部丢弃。
 
 ``` java
-package me.zjy;
-
-import org.apache.flink.api.common.functions.FilterFunction;
-import org.apache.flink.api.common.functions.MapFunction;
-import org.apache.flink.api.common.functions.ReduceFunction;
-import org.apache.flink.api.java.tuple.Tuple3;
-import org.apache.flink.streaming.api.TimeCharacteristic;
-import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
-import org.apache.flink.streaming.api.watermark.Watermark;
-import org.apache.flink.streaming.api.windowing.time.Time;
-
-import javax.annotation.Nullable;
-import java.time.LocalDateTime;
-import java.time.ZoneOffset;
-
 public class BandwidthMonitorWithEventTime {
 
     public static void main(String[] args) throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         // 设置事件时间
         env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
-
         DataStream<String> text = env.socketTextStream("localhost", 8080);
-        text.map(new MapFunction<String, Tuple3<Integer,String, Long>>() {
+        // 在执行任何操作前需要先执行watermark设置
+        text.assignTimestampsAndWatermarks(new BoundedOutOfOrdernessTimestampExtractor<String>(Time.minutes(1L)) {
+            @Override
+            public long extractTimestamp(String element) {
+                int time = (int) LocalDateTime.parse(element.split(" ")[0]).toEpochSecond(ZoneOffset.ofHours(8));
+                return time * 1000L;
+            }
+        }).map(new MapFunction<String, Tuple3<Integer,String, Long>>() {
             @Override
             public Tuple3<Integer,String, Long> map(String s) throws Exception {
                 String[] items = s.split(" ");
@@ -272,38 +261,20 @@ public class BandwidthMonitorWithEventTime {
                 String channel = items[1];
                 Long flow = Long.parseLong(items[2]);
                 return new Tuple3<>(time, channel, flow);
-            }
-        }).assignTimestampsAndWatermarks(new WatermarkGenerator())
-                .keyBy(1)
-                .timeWindow(Time.minutes(1))
+            }}).keyBy(1)
+                .timeWindow(Time.minutes(5),Time.seconds(5))
                 .reduce((ReduceFunction<Tuple3<Integer, String, Long>>) (integerStringLongTuple3, t1) -> new Tuple3<>(integerStringLongTuple3.f0,integerStringLongTuple3.f1,integerStringLongTuple3.f2 + t1.f2))
+                .map(new MapFunction<Tuple3<Integer, String, Long>, Tuple2<String,Double>>() {
+                    @Override
+                    public Tuple2<String, Double> map(Tuple3<Integer, String, Long> integerStringLongTuple3) throws Exception {
+                        return new Tuple2<>(integerStringLongTuple3.f1,integerStringLongTuple3.f2 * 8.0 / 60 / 1024 / 1024);
+                    }
+                })
                 // 过滤出带宽值低于100Mbps域名
-                .filter((FilterFunction<Tuple3<Integer, String, Long>>) integerStringLongTuple3 -> integerStringLongTuple3.f2 * 8.0 / 60 / 1024 / 1024 < 100)
-                .print();
+                .filter((FilterFunction<Tuple2<String, Double>>) stringDoubleTuple2 -> stringDoubleTuple2.f1 < 100.0).print();
 
-        env.execute("BandwidthMonitor");
+        env.execute("BandwidthMonitorWithEventTime");
     }
-
-    private static class WatermarkGenerator implements AssignerWithPeriodicWatermarks<Tuple3<Integer,String,Long>> {
-
-        private long maxTimestamp = -1L;
-
-        @Nullable
-        @Override
-        public Watermark getCurrentWatermark() {
-            // Watermark设置为当前最大数据时间-1分钟
-            return new Watermark(maxTimestamp - 60 * 1000L);
-        }
-
-        @Override
-        public long extractTimestamp(Tuple3<Integer, String, Long> element, long previousElementTimestamp) {
-            long time = element.f0 * 1000L;
-            // 更新当前最大时间戳
-            maxTimestamp = Math.max(time,maxTimestamp);
-            return time;
-        }
-    }
-
 }
 
 ```
@@ -321,7 +292,8 @@ public class BandwidthMonitorWithEventTime {
 输出结果
 
 ```
-
+2> (www.163.com,0.0012715657552083333)
+2> (www.163.com,0.0012969970703125)
 ```
 
 
@@ -329,5 +301,99 @@ public class BandwidthMonitorWithEventTime {
 在这个代码片段中有几个比较重要的点：
 
 1. env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime) 指定使用事件事件
-2. assignTimestampsAndWatermarks 指定事件获取方式以及Watermark生成策略
+2. assignTimestampsAndWatermarks 指定事件获取方式以及Watermark生成策略，这里我们使用了自带的 BoundedOutOfOrdernessTimestampExtractor 
+
+
+
+下面我们简单看下 BoundedOutOfOrdernessTimestampExtractor 的源码，这有助于我们更好理解Watermark
+
+``` java
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.streaming.api.functions.timestamps;
+
+import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
+import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.api.windowing.time.Time;
+
+/**
+ * This is a {@link AssignerWithPeriodicWatermarks} used to emit Watermarks that lag behind the element with
+ * the maximum timestamp (in event time) seen so far by a fixed amount of time, <code>t_late</code>. This can
+ * help reduce the number of elements that are ignored due to lateness when computing the final result for a
+ * given window, in the case where we know that elements arrive no later than <code>t_late</code> units of time
+ * after the watermark that signals that the system event-time has advanced past their (event-time) timestamp.
+ * */
+public abstract class BoundedOutOfOrdernessTimestampExtractor<T> implements AssignerWithPeriodicWatermarks<T> {
+
+	private static final long serialVersionUID = 1L;
+
+	/** The current maximum timestamp seen so far. */
+	private long currentMaxTimestamp;
+
+	/** The timestamp of the last emitted watermark. */
+	private long lastEmittedWatermark = Long.MIN_VALUE;
+
+	/**
+	 * The (fixed) interval between the maximum seen timestamp seen in the records
+	 * and that of the watermark to be emitted.
+	 */
+	private final long maxOutOfOrderness;
+
+	public BoundedOutOfOrdernessTimestampExtractor(Time maxOutOfOrderness) {
+		if (maxOutOfOrderness.toMilliseconds() < 0) {
+			throw new RuntimeException("Tried to set the maximum allowed " +
+				"lateness to " + maxOutOfOrderness + ". This parameter cannot be negative.");
+		}
+		this.maxOutOfOrderness = maxOutOfOrderness.toMilliseconds();
+		this.currentMaxTimestamp = Long.MIN_VALUE + this.maxOutOfOrderness;
+	}
+
+	public long getMaxOutOfOrdernessInMillis() {
+		return maxOutOfOrderness;
+	}
+
+	/**
+	 * Extracts the timestamp from the given element.
+	 *
+	 * @param element The element that the timestamp is extracted from.
+	 * @return The new timestamp.
+	 */
+	public abstract long extractTimestamp(T element);
+
+	@Override
+	public final Watermark getCurrentWatermark() {
+		// this guarantees that the watermark never goes backwards.
+		long potentialWM = currentMaxTimestamp - maxOutOfOrderness;
+		if (potentialWM >= lastEmittedWatermark) {
+			lastEmittedWatermark = potentialWM;
+		}
+		return new Watermark(lastEmittedWatermark);
+	}
+
+	@Override
+	public final long extractTimestamp(T element, long previousElementTimestamp) {
+		long timestamp = extractTimestamp(element);
+		if (timestamp > currentMaxTimestamp) {
+			currentMaxTimestamp = timestamp;
+		}
+		return timestamp;
+	}
+}
+```
 

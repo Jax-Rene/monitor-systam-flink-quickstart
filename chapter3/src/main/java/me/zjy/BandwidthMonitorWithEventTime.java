@@ -10,12 +10,14 @@ import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks;
+import org.apache.flink.streaming.api.functions.timestamps.BoundedOutOfOrdernessTimestampExtractor;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.api.windowing.time.Time;
 
 import javax.annotation.Nullable;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.concurrent.TimeUnit;
 
 public class BandwidthMonitorWithEventTime {
 
@@ -23,9 +25,15 @@ public class BandwidthMonitorWithEventTime {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         // 设置事件时间
         env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
-
         DataStream<String> text = env.socketTextStream("localhost", 8080);
-        text.filter(line -> StringUtils.isNotBlank(line)).map(new MapFunction<String, Tuple3<Integer,String, Long>>() {
+        // 在执行任何操作前需要先执行watermark设置
+        text.assignTimestampsAndWatermarks(new BoundedOutOfOrdernessTimestampExtractor<String>(Time.minutes(1L)) {
+            @Override
+            public long extractTimestamp(String element) {
+                int time = (int) LocalDateTime.parse(element.split(" ")[0]).toEpochSecond(ZoneOffset.ofHours(8));
+                return time * 1000L;
+            }
+        }).map(new MapFunction<String, Tuple3<Integer,String, Long>>() {
             @Override
             public Tuple3<Integer,String, Long> map(String s) throws Exception {
                 String[] items = s.split(" ");
@@ -34,8 +42,7 @@ public class BandwidthMonitorWithEventTime {
                 String channel = items[1];
                 Long flow = Long.parseLong(items[2]);
                 return new Tuple3<>(time, channel, flow);
-            }}).assignTimestampsAndWatermarks(new WatermarkGenerator())
-                .keyBy(1)
+            }}).keyBy(1)
                 .timeWindow(Time.minutes(5),Time.seconds(5))
                 .reduce((ReduceFunction<Tuple3<Integer, String, Long>>) (integerStringLongTuple3, t1) -> new Tuple3<>(integerStringLongTuple3.f0,integerStringLongTuple3.f1,integerStringLongTuple3.f2 + t1.f2))
                 .map(new MapFunction<Tuple3<Integer, String, Long>, Tuple2<String,Double>>() {
@@ -50,24 +57,6 @@ public class BandwidthMonitorWithEventTime {
         env.execute("BandwidthMonitorWithEventTime");
     }
 
-    private static class WatermarkGenerator implements AssignerWithPeriodicWatermarks<Tuple3<Integer,String,Long>> {
 
-        private long maxTimestamp = -1L;
-
-        @Nullable
-        @Override
-        public Watermark getCurrentWatermark() {
-            // Watermark设置为当前最大数据时间-1分钟
-            return new Watermark(maxTimestamp - 60 * 1000L);
-        }
-
-        @Override
-        public long extractTimestamp(Tuple3<Integer, String, Long> element, long previousElementTimestamp) {
-            long time = element.f0 * 1000L;
-            // 更新当前最大时间戳
-            maxTimestamp = Math.max(time,maxTimestamp);
-            return time;
-        }
-    }
 
 }
