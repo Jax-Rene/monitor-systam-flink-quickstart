@@ -397,3 +397,60 @@ public abstract class BoundedOutOfOrdernessTimestampExtractor<T> implements Assi
 }
 ```
 
+BoundedOutOfOrdernessTimestampExtractor 实现很简单，首先该类继承了 实现了AssignerWithPeriodicWatermarks接口。通过名字可以知道该接口是周期性生成Watermark的。相对的，还有一个AssignerWithPunctuatedWatermarks接口，是通过数据驱动的方式生成Watermark的，AssignerWithPunctuatedWatermarks在流量较高的情况下可能会引起一定的延迟。
+
+除此之外，BoundedOutOfOrdernessTimestampExtractor构造函数需要传入一个允许的延迟时间。
+
+> Watermark 实际上就是通过延迟等待，来解决数据延迟的问题。
+
+接下来对于每条数据会调用 extractTimestamp 方法，获取毫秒级的事件时间，获取的同时，更新当前输入的最大时间戳。然后调用getCurrentWatermark方法获取当前Watermark（最大时间 - 我们构造函数传入的容忍时间）。
+
+我们可以看到，这个过程没有依赖任何系统时间，而全部是使用事件时间，**这保证了程序的准确性、可回测性。**
+
+
+
+## 2. 更多高级特性 - 会话窗口
+
+上面我们讲了事件时间、处理时间以及对应的时间窗口机制。
+
+Flink 除了上面提供的几种窗口外，还有一种比较特殊的窗口：会话窗口。
+
+会话窗口指这样的窗口，它需要指定一个活跃时间 t，若过了时间t还未收到数据，窗口就会关闭。
+
+可以把这个理解为会话的生命周期。
+
+如图所示：
+
+![session-windows](./img/session-windows.svg)
+
+由于会话窗口比较少见，具体的代码这里就不再赘述。
+
+详见：[官网文档](https://ci.apache.org/projects/flink/flink-docs-release-1.9/dev/stream/operators/windows.html#session-windows)
+
+
+
+## 3. 窗口源码解析
+
+待补充
+
+
+
+## 4. 总结
+
+这节我们通过简单的计算带宽监控，学习到了Flink中的三种时间：
+
+1. 处理时间
+2. 摄入时间
+3. 事件时间
+
+并且学习到了三种时间的区别，以及使用场景。在实践中，我们应该根据监控场景使用特定的时间。
+
+例如，需要灵活多变的情况下，以及对精度要求不高的情况使用处理时间更灵活自由简单。而对于结果要求准确特别是希望程序具有可回测性，那么选择事件时间，那如果没有事件时间怎么办呢？可退而舍之取摄入时间。
+
+我们还学习了三种时间对应的不同窗口机制。这里主要是详细介绍了事件时间窗口的使用，引入了Watermark保证了数据延迟、乱序的可处理性，以及对延迟数据的处理策略。通过上面的知识，我们实现了基于事件时间的带宽监控程序。
+
+最后，我们简要介绍了会话窗口，该窗口在目前的流式计算框架中，仅Flink支持，属于高级特性。
+
+尽管如此，我们的监控程序还有很多点需要完善。例如，在窗口汇聚的过程中，TM宕机了，数据如何保证准确呢？数据在内存中跟着宕机会瞬间丢失。以及，如何执行程序回测呢？
+
+下一节，我们将介绍Flink的另外一个核心特性：检查点及保存点机制。
